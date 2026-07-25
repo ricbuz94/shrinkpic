@@ -2,7 +2,6 @@ const std = @import("std");
 const c = @import("c_api");
 const shrink = @import("shrinkpic");
 
-const MAX_SIZE = shrink.MAX_SIZE;
 const WorkerCount = 8;
 
 const Job = struct {
@@ -30,7 +29,7 @@ fn compressJpeg(io: std.Io, allocator: std.mem.Allocator, path: []const u8, pixe
             return error.TjCompress;
         defer _ = c.tjFree(out_buf);
 
-        if (out_size <= MAX_SIZE) {
+        if (out_size <= shrink.MAX_SIZE) {
             const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.shrunk.jpg", .{ out_dir, std.fs.path.stem(path) });
             defer allocator.free(out_path);
             const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
