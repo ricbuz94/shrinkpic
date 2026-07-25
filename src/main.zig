@@ -7,6 +7,7 @@ const WorkerCount = 8;
 
 const Job = struct {
     path: []const u8,
+    out_dir: []const u8,
 };
 
 const Shared = struct {
@@ -16,7 +17,34 @@ const Shared = struct {
     allocator: std.mem.Allocator,
 };
 
-fn processJpeg(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
+fn compressJpeg(io: std.Io, allocator: std.mem.Allocator, path: []const u8, pixels: []const u8, width: c_int, height: c_int, subsamp: c_int, out_dir: []const u8) !void {
+    const ch = c.tjInitCompress();
+    if (ch == null) return error.TjInit;
+    defer _ = c.tjDestroy(ch);
+
+    var quality: c_int = 90;
+    while (quality >= 20) : (quality -= 5) {
+        var out_buf: [*c]u8 = null;
+        var out_size: c_ulong = 0;
+        if (c.tjCompress2(ch, pixels.ptr, width, 0, height, c.TJPF_RGB, &out_buf, &out_size, subsamp, quality, 0) != 0)
+            return error.TjCompress;
+        defer _ = c.tjFree(out_buf);
+
+        if (out_size <= MAX_SIZE) {
+            const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.shrunk.jpg", .{ out_dir, std.fs.path.stem(path) });
+            defer allocator.free(out_path);
+            const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+            defer out_file.close(io);
+            var file_writer = out_file.writer(io, &.{});
+            try file_writer.interface.writeAll(out_buf[0..out_size]);
+            std.debug.print("OK {s} -> {d} bytes q={d}\n", .{ path, out_size, quality });
+            return;
+        }
+    }
+    std.debug.print("FAIL {s} still >1MB\n", .{path});
+}
+
+fn processJpeg(io: std.Io, allocator: std.mem.Allocator, path: []const u8, out_dir: []const u8) !void {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
 
@@ -42,34 +70,10 @@ fn processJpeg(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void
     if (c.tjDecompress2(handle, data.ptr, @intCast(data.len), pixels.ptr, width, 0, height, c.TJPF_RGB, 0) != 0)
         return error.TjDecompress;
 
-    const ch = c.tjInitCompress();
-    if (ch == null) return error.TjInit;
-    defer _ = c.tjDestroy(ch);
-
-    var quality: c_int = 90;
-    while (quality >= 20) : (quality -= 5) {
-        var out_buf: [*c]u8 = null;
-        var out_size: c_ulong = 0;
-        if (c.tjCompress2(ch, pixels.ptr, width, 0, height, c.TJPF_RGB, &out_buf, &out_size, subsamp, quality, 0) != 0)
-            return error.TjCompress;
-        defer _ = c.tjFree(out_buf);
-
-        if (out_size <= MAX_SIZE) {
-            const out_path = try std.fmt.allocPrint(allocator, "{s}.shrunk.jpg", .{path});
-            defer allocator.free(out_path);
-            const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
-            defer out_file.close(io);
-
-            var file_writer = out_file.writer(io, &.{});
-            try file_writer.interface.writeAll(out_buf[0..out_size]);
-            std.debug.print("OK jpeg {s} -> {d} bytes q={d}\n", .{ path, out_size, quality });
-            return;
-        }
-    }
-    std.debug.print("FAIL jpeg {s} still >1MB\n", .{path});
+    try compressJpeg(io, allocator, path, pixels, width, height, subsamp, out_dir);
 }
 
-fn processPng(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
+fn processPng(io: std.Io, allocator: std.mem.Allocator, path: []const u8, out_dir: []const u8) !void {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
 
@@ -119,6 +123,7 @@ fn processPng(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     const row_bytes = c.png_get_rowbytes(png_ptr, info_ptr);
     const pixels = try allocator.alloc(u8, @intCast(row_bytes * height));
     defer allocator.free(pixels);
+
     var row_ptrs = try allocator.alloc([*c]u8, @intCast(height));
     defer allocator.free(row_ptrs);
     for (0..height) |y| row_ptrs[y] = pixels.ptr + y * row_bytes;
@@ -126,104 +131,21 @@ fn processPng(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     c.png_read_image(png_ptr, row_ptrs.ptr);
     c.png_read_end(png_ptr, null);
 
-    // Scale down until under ~1MB (estimate)
-    var scale: f32 = 1.0;
-    const max_pixels: u64 = 2_000_000;
-    if (@as(u64, width) * height > max_pixels) {
-        scale = @sqrt(@as(f32, @floatFromInt(max_pixels)) / @as(f32, @floatFromInt(width * height)));
+    // RGBA → RGB
+    const rgb = try allocator.alloc(u8, @intCast(width * height * 3));
+    defer allocator.free(rgb);
+
+    const px = @as(usize, @intCast(width * height));
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < px) : (i += 1) {
+        rgb[j] = pixels[i * 4];
+        rgb[j + 1] = pixels[i * 4 + 1];
+        rgb[j + 2] = pixels[i * 4 + 2];
+        j += 3;
     }
-    var attempt: u8 = 0;
-    while (attempt < 8) : (attempt += 1) {
-        const sw: u32 = @intFromFloat(@as(f32, @floatFromInt(width)) * scale);
-        const sh: u32 = @intFromFloat(@as(f32, @floatFromInt(height)) * scale);
-        if (sw < 16 or sh < 16) break;
 
-        // Simple nearest-neighbor downsample
-        const srow = sw * 4;
-        const scaled = try allocator.alloc(u8, srow * sh);
-        defer allocator.free(scaled);
-        for (0..sh) |y| {
-            const sy = @as(usize, @intFromFloat(@as(f32, @floatFromInt(y)) / scale));
-            const src = pixels[sy * row_bytes ..][0..row_bytes];
-            const dst = scaled[y * srow ..][0..srow];
-            for (0..sw) |x| {
-                const sx = @as(usize, @intFromFloat(@as(f32, @floatFromInt(x)) / scale)) * 4;
-                @memcpy(dst[x * 4 ..][0..4], src[sx..][0..4]);
-            }
-        }
-
-        // Quantize to 256 colors (first-seen)
-        var palette: [256]c.png_color = undefined;
-        var palette_size: c_int = 0;
-        var color_map = std.AutoHashMap(u32, u8).init(allocator);
-        defer color_map.deinit();
-
-        for (0..sh) |y| {
-            const row = scaled[y * srow ..][0..srow];
-            var x: usize = 0;
-            while (x + 3 < row.len) : (x += 4) {
-                const key: u32 = (@as(u32, row[x]) << 16) | (@as(u32, row[x + 1]) << 8) | row[x + 2];
-                if (color_map.get(key) == null and palette_size < 256) {
-                    try color_map.put(key, @intCast(palette_size));
-                    palette[@intCast(palette_size)] = .{ .red = row[x], .green = row[x + 1], .blue = row[x + 2] };
-                    palette_size += 1;
-                }
-            }
-        }
-
-        const indexed = try allocator.alloc(u8, sw * sh);
-        defer allocator.free(indexed);
-        for (0..sh) |y| {
-            const row = scaled[y * srow ..][0..srow];
-            for (0..sw) |x| {
-                const key: u32 = (@as(u32, row[x * 4]) << 16) | (@as(u32, row[x * 4 + 1]) << 8) | row[x * 4 + 2];
-                indexed[y * sw + x] = color_map.get(key) orelse 0;
-            }
-        }
-
-        // Write
-        var write_png = c.png_create_write_struct(c.PNG_LIBPNG_VER_STRING, null, null, null);
-        if (write_png == null) return error.PngInit;
-        defer c.png_destroy_write_struct(&write_png, null);
-        const write_info = c.png_create_info_struct(write_png);
-        if (write_info == null) return error.PngInit;
-
-        var out_buf: std.ArrayList(u8) = .empty;
-        defer out_buf.deinit(allocator);
-        const WriteCtx = struct {
-            list: *std.ArrayList(u8),
-            alloc: std.mem.Allocator,
-            fn write(png: ?*c.png_struct, buf: [*c]u8, len: c.png_size_t) callconv(.c) void {
-                const context: *@This() = @ptrCast(@alignCast(c.png_get_io_ptr(png)));
-                context.list.appendSlice(context.alloc, buf[0..len]) catch {};
-            }
-        };
-        var wctx = WriteCtx{ .list = &out_buf, .alloc = allocator };
-        c.png_set_write_fn(write_png, &wctx, WriteCtx.write, null);
-
-        c.png_set_IHDR(write_png, write_info, sw, sh, 8, c.PNG_COLOR_TYPE_PALETTE, c.PNG_INTERLACE_NONE, c.PNG_COMPRESSION_TYPE_DEFAULT, c.PNG_FILTER_TYPE_DEFAULT);
-        c.png_set_PLTE(write_png, write_info, &palette, palette_size);
-        c.png_write_info(write_png, write_info);
-
-        var idx_rows = try allocator.alloc([*c]u8, sh);
-        defer allocator.free(idx_rows);
-        for (0..sh) |y| idx_rows[y] = indexed.ptr + y * sw;
-        c.png_write_image(write_png, idx_rows.ptr);
-        c.png_write_end(write_png, null);
-
-        if (out_buf.items.len <= MAX_SIZE) {
-            const out_path = try std.fmt.allocPrint(allocator, "{s}.shrunk.png", .{path});
-            defer allocator.free(out_path);
-            const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
-            defer out_file.close(io);
-            var file_writer = out_file.writer(io, &.{});
-            try file_writer.interface.writeAll(out_buf.items);
-            std.debug.print("OK png {s} -> {d} bytes (palette {d} scale {d})\n", .{ path, out_buf.items.len, palette_size, scale });
-            return;
-        }
-        scale *= 0.7;
-    }
-    std.debug.print("FAIL png {s} cannot fit under 1MB\n", .{path});
+    try compressJpeg(io, allocator, path, rgb, @intCast(width), @intCast(height), c.TJSAMP_420, out_dir);
 }
 
 fn worker(io: std.Io, shared: *Shared) void {
@@ -247,11 +169,11 @@ fn worker(io: std.Io, shared: *Shared) void {
         const ext = std.fs.path.extension(job.path);
 
         if (std.mem.eql(u8, ext, ".jpg") or std.mem.eql(u8, ext, ".jpeg")) {
-            processJpeg(io, shared.allocator, job.path) catch |e| {
+            processJpeg(io, shared.allocator, job.path, job.out_dir) catch |e| {
                 std.debug.print("err jpeg {s}: {}\n", .{ job.path, e });
             };
         } else if (std.mem.eql(u8, ext, ".png")) {
-            processPng(io, shared.allocator, job.path) catch |e| {
+            processPng(io, shared.allocator, job.path, job.out_dir) catch |e| {
                 std.debug.print("err png {s}: {}\n", .{ job.path, e });
             };
         }
@@ -272,6 +194,9 @@ pub fn main(init: std.process.Init) !void {
 
     const dir_path = args[1];
 
+    const out_dir = if (args.len >= 3) args[2] else dir_path;
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
+
     var shared = Shared{
         .queue = std.ArrayList(Job).empty,
         .allocator = allocator,
@@ -284,7 +209,7 @@ pub fn main(init: std.process.Init) !void {
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         const full = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-        try shared.queue.append(allocator, .{ .path = full });
+        try shared.queue.append(allocator, .{ .path = full, .out_dir = out_dir });
     }
 
     var threads: [WorkerCount]std.Thread = undefined;
