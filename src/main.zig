@@ -74,11 +74,9 @@ fn processPng(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     defer file.close(io);
 
     var file_reader = file.reader(io, &.{});
-
     const data = try file_reader.interface.allocRemaining(allocator, .limited(50 * 1024 * 1024));
     defer allocator.free(data);
 
-    // Decode with libpng
     var png_ptr = c.png_create_read_struct(c.PNG_LIBPNG_VER_STRING, null, null, null);
     if (png_ptr == null) return error.PngInit;
     defer c.png_destroy_read_struct(&png_ptr, null, null);
@@ -86,7 +84,6 @@ fn processPng(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     const info_ptr = c.png_create_info_struct(png_ptr);
     if (info_ptr == null) return error.PngInit;
 
-    // Memory read
     var offset: usize = 0;
     const ReadCtx = struct {
         data: []const u8,
@@ -108,7 +105,6 @@ fn processPng(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     const color_type = c.png_get_color_type(png_ptr, info_ptr);
     const bit_depth = c.png_get_bit_depth(png_ptr, info_ptr);
 
-    // Force RGBA 8-bit
     if (bit_depth == 16) c.png_set_strip_16(png_ptr);
     if (color_type == c.PNG_COLOR_TYPE_PALETTE) c.png_set_palette_to_rgb(png_ptr);
     if (color_type == c.PNG_COLOR_TYPE_GRAY and bit_depth < 8) c.png_set_expand_gray_1_2_4_to_8(png_ptr);
@@ -130,92 +126,104 @@ fn processPng(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     c.png_read_image(png_ptr, row_ptrs.ptr);
     c.png_read_end(png_ptr, null);
 
-    // Quantize to 256-color palette (simple median-cut style: sample + reduce)
-    // For production use a proper quantizer; here: force palette via libpng write
-    // Write quantized PNG
-    var write_png = c.png_create_write_struct(c.PNG_LIBPNG_VER_STRING, null, null, null);
-    if (write_png == null) return error.PngInit;
-    defer c.png_destroy_write_struct(&write_png, null);
+    // Scale down until under ~1MB (estimate)
+    var scale: f32 = 1.0;
+    const max_pixels: u64 = 2_000_000;
+    if (@as(u64, width) * height > max_pixels) {
+        scale = @sqrt(@as(f32, @floatFromInt(max_pixels)) / @as(f32, @floatFromInt(width * height)));
+    }
+    var attempt: u8 = 0;
+    while (attempt < 8) : (attempt += 1) {
+        const sw: u32 = @intFromFloat(@as(f32, @floatFromInt(width)) * scale);
+        const sh: u32 = @intFromFloat(@as(f32, @floatFromInt(height)) * scale);
+        if (sw < 16 or sh < 16) break;
 
-    const write_info = c.png_create_info_struct(write_png);
-    if (write_info == null) return error.PngInit;
-
-    // Collect unique colors (simple, max 256)
-    var palette: [256]c.png_color = undefined;
-    var palette_size: c_int = 0;
-    var color_map = std.AutoHashMap(u32, u8).init(allocator);
-    defer color_map.deinit();
-
-    for (0..@intCast(height)) |y| {
-        const row = pixels[y * row_bytes ..][0..row_bytes];
-        var x: usize = 0;
-        while (x + 3 < row.len) : (x += 4) {
-            const r = row[x];
-            const g = row[x + 1];
-            const b = row[x + 2];
-            const key: u32 = (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
-            if (color_map.get(key) == null and palette_size < 256) {
-                const idx: u8 = @intCast(palette_size);
-                try color_map.put(key, idx);
-                palette[@intCast(palette_size)] = .{ .red = r, .green = g, .blue = b };
-                palette_size += 1;
+        // Simple nearest-neighbor downsample
+        const srow = sw * 4;
+        const scaled = try allocator.alloc(u8, srow * sh);
+        defer allocator.free(scaled);
+        for (0..sh) |y| {
+            const sy = @as(usize, @intFromFloat(@as(f32, @floatFromInt(y)) / scale));
+            const src = pixels[sy * row_bytes ..][0..row_bytes];
+            const dst = scaled[y * srow ..][0..srow];
+            for (0..sw) |x| {
+                const sx = @as(usize, @intFromFloat(@as(f32, @floatFromInt(x)) / scale)) * 4;
+                @memcpy(dst[x * 4 ..][0..4], src[sx..][0..4]);
             }
         }
-    }
 
-    // Index buffer
-    const indexed = try allocator.alloc(u8, @intCast(width * height));
-    defer allocator.free(indexed);
-    for (0..@intCast(height)) |y| {
-        const row = pixels[y * row_bytes ..][0..row_bytes];
-        var x: usize = 0;
-        while (x + 3 < row.len) : (x += 4) {
-            const r = row[x];
-            const g = row[x + 1];
-            const b = row[x + 2];
-            const key: u32 = (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
-            const idx = color_map.get(key) orelse 0;
-            indexed[y * @as(usize, @intCast(width)) + x / 4] = idx;
+        // Quantize to 256 colors (first-seen)
+        var palette: [256]c.png_color = undefined;
+        var palette_size: c_int = 0;
+        var color_map = std.AutoHashMap(u32, u8).init(allocator);
+        defer color_map.deinit();
+
+        for (0..sh) |y| {
+            const row = scaled[y * srow ..][0..srow];
+            var x: usize = 0;
+            while (x + 3 < row.len) : (x += 4) {
+                const key: u32 = (@as(u32, row[x]) << 16) | (@as(u32, row[x + 1]) << 8) | row[x + 2];
+                if (color_map.get(key) == null and palette_size < 256) {
+                    try color_map.put(key, @intCast(palette_size));
+                    palette[@intCast(palette_size)] = .{ .red = row[x], .green = row[x + 1], .blue = row[x + 2] };
+                    palette_size += 1;
+                }
+            }
         }
-    }
 
-    // Write to memory
-    var out_buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
-    defer out_buf.deinit(allocator);
-    const WriteCtx = struct {
-        list: *std.ArrayList(u8),
-        alloc: std.mem.Allocator,
-        fn write(png: ?*c.png_struct, buf: [*c]u8, len: c.png_size_t) callconv(.c) void {
-            const context: *@This() = @ptrCast(@alignCast(c.png_get_io_ptr(png)));
-            context.list.appendSlice(context.alloc, buf[0..len]) catch {};
+        const indexed = try allocator.alloc(u8, sw * sh);
+        defer allocator.free(indexed);
+        for (0..sh) |y| {
+            const row = scaled[y * srow ..][0..srow];
+            for (0..sw) |x| {
+                const key: u32 = (@as(u32, row[x * 4]) << 16) | (@as(u32, row[x * 4 + 1]) << 8) | row[x * 4 + 2];
+                indexed[y * sw + x] = color_map.get(key) orelse 0;
+            }
         }
-    };
-    var wctx = WriteCtx{ .list = &out_buf, .alloc = allocator };
-    c.png_set_write_fn(write_png, &wctx, WriteCtx.write, null);
 
-    c.png_set_IHDR(write_png, write_info, width, height, 8, c.PNG_COLOR_TYPE_PALETTE, c.PNG_INTERLACE_NONE, c.PNG_COMPRESSION_TYPE_DEFAULT, c.PNG_FILTER_TYPE_DEFAULT);
-    c.png_set_PLTE(write_png, write_info, &palette, palette_size);
-    c.png_write_info(write_png, write_info);
+        // Write
+        var write_png = c.png_create_write_struct(c.PNG_LIBPNG_VER_STRING, null, null, null);
+        if (write_png == null) return error.PngInit;
+        defer c.png_destroy_write_struct(&write_png, null);
+        const write_info = c.png_create_info_struct(write_png);
+        if (write_info == null) return error.PngInit;
 
-    var idx_rows = try allocator.alloc([*c]u8, @intCast(height));
-    defer allocator.free(idx_rows);
-    for (0..height) |y| idx_rows[y] = indexed.ptr + y * @as(usize, @intCast(width));
-    c.png_write_image(write_png, idx_rows.ptr);
-    c.png_write_end(write_png, null);
+        var out_buf: std.ArrayList(u8) = .empty;
+        defer out_buf.deinit(allocator);
+        const WriteCtx = struct {
+            list: *std.ArrayList(u8),
+            alloc: std.mem.Allocator,
+            fn write(png: ?*c.png_struct, buf: [*c]u8, len: c.png_size_t) callconv(.c) void {
+                const context: *@This() = @ptrCast(@alignCast(c.png_get_io_ptr(png)));
+                context.list.appendSlice(context.alloc, buf[0..len]) catch {};
+            }
+        };
+        var wctx = WriteCtx{ .list = &out_buf, .alloc = allocator };
+        c.png_set_write_fn(write_png, &wctx, WriteCtx.write, null);
 
-    if (out_buf.items.len <= MAX_SIZE) {
-        const out_path = try std.fmt.allocPrint(allocator, "{s}.shrunk.png", .{path});
-        defer allocator.free(out_path);
+        c.png_set_IHDR(write_png, write_info, sw, sh, 8, c.PNG_COLOR_TYPE_PALETTE, c.PNG_INTERLACE_NONE, c.PNG_COMPRESSION_TYPE_DEFAULT, c.PNG_FILTER_TYPE_DEFAULT);
+        c.png_set_PLTE(write_png, write_info, &palette, palette_size);
+        c.png_write_info(write_png, write_info);
 
-        const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
-        defer out_file.close(io);
+        var idx_rows = try allocator.alloc([*c]u8, sh);
+        defer allocator.free(idx_rows);
+        for (0..sh) |y| idx_rows[y] = indexed.ptr + y * sw;
+        c.png_write_image(write_png, idx_rows.ptr);
+        c.png_write_end(write_png, null);
 
-        var file_writer = out_file.writer(io, &.{});
-        try file_writer.interface.writeAll(out_buf.items);
-        std.debug.print("OK png {s} -> {d} bytes (palette {d})\n", .{ path, out_buf.items.len, palette_size });
-    } else {
-        std.debug.print("FAIL png {s} still >1MB after quantize\n", .{path});
+        if (out_buf.items.len <= MAX_SIZE) {
+            const out_path = try std.fmt.allocPrint(allocator, "{s}.shrunk.png", .{path});
+            defer allocator.free(out_path);
+            const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+            defer out_file.close(io);
+            var file_writer = out_file.writer(io, &.{});
+            try file_writer.interface.writeAll(out_buf.items);
+            std.debug.print("OK png {s} -> {d} bytes (palette {d} scale {d})\n", .{ path, out_buf.items.len, palette_size, scale });
+            return;
+        }
+        scale *= 0.7;
     }
+    std.debug.print("FAIL png {s} cannot fit under 1MB\n", .{path});
 }
 
 fn worker(io: std.Io, shared: *Shared) void {
@@ -252,9 +260,7 @@ fn worker(io: std.Io, shared: *Shared) void {
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.smp_allocator;
 
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
@@ -288,7 +294,7 @@ pub fn main(init: std.process.Init) !void {
 
     try shared.mutex.lock(io);
     shared.done = true;
-    defer shared.mutex.unlock(io);
+    shared.mutex.unlock(io);
 
     for (threads) |t| t.join();
 
