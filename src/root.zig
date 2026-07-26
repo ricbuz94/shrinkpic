@@ -1,2 +1,5 @@
 const std = @import("std");
-pub const MAX_SIZE: usize = 1 * 1024 * 1024; // 1 MB
+
+pub const DEFAULT_WORKER_COUNT: usize = 8;
+pub const DEFAULT_MAX_SIZE: usize = 200 * 1024; // 200 KB
+pub const DEFAULT_FORCE_JPEG: bool = false;
