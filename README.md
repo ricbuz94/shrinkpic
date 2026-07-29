@@ -5,7 +5,7 @@ Multi-threaded tool written in Zig 0.16 that downscales and compresses images to
 ## Features
 
 - **Universal Input**: Accepts any major image format (JPEG, PNG, BMP, TGA, GIF, etc.) thanks to `stb_image`.
-- **Photo-Grade Downscaling**: High-quality linear resizing down to a web-optimized 1920px (with an automatic emergency fallback to 1280px for ultra-dense images) using `stb_image_resize2`.
+- **Photo-Grade Downscaling**: High-quality linear resizing down to a web-optimized 1920px (if bigger) using `stb_image_resize2`.
 - **Modern Optimization**: Supports exporting to next-gen **WebP** format (default) or progressive **JPEG** (`libjpeg-turbo`).
 - **Metadata Stripping**: Automatically purges heavy EXIF, GPS, and IPTC data to maximize visual byte allocation.
 - **Smart Concurrency**: Dynamic multi-threaded thread pool with safety bounds.
@@ -35,7 +35,16 @@ _Note: `stb_image` and `stb_image_resize2` are header-only and vendorcompiled in
 ```bash
 git clone https://github.com/ricbuz94/shrinkpic
 cd shrinkpic
+
+zig build -Doptimize=ReleaseSafe
+# Maximum safety. It keeps runtime checks (like out-of-bounds or
+# overflows) active. If a bug occurs, it triggers a clean panic.
+#
+# or
+#
 zig build -Doptimize=ReleaseFast
+# Maximum speed. It removes all safety checks to optimize hardware
+# and loops (SIMD). If a bug occurs, it leads to Undefined Behavior.
 ```
 
 Binary destination: `zig-out/bin/shrinkpic`

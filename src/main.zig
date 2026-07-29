@@ -20,20 +20,20 @@ const Shared = struct {
     allocator: std.mem.Allocator,
 };
 
-fn compressAnyToWebP(io: anytype, allocator: std.mem.Allocator, path: []const u8, out_dir: []const u8) !void {
+fn compressToWebPOrJpeg(io: anytype, allocator: std.mem.Allocator, path: []const u8, out_dir: []const u8) !void {
     const max_pixel_dim: c_int = 1920;
 
     // -------------------------------------------------------------------------
     // FASE 1: LETTURA UNIVERSALE (stb_image)
     // -------------------------------------------------------------------------
-    const c_path = try allocator.dupeZ(u8, path);
+    const c_path = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(c_path);
 
     var width: c_int = 0;
     var height: c_int = 0;
     var comp: c_int = 0;
     if (c.stbi_info(c_path.ptr, &width, &height, &comp) == 0) {
-        std.log.warn("Saltato file non supportato o non valido: {s}", .{path});
+        std.log.err("SKIPPED file {s} is not a valid image", .{path});
         return;
     }
 
@@ -42,7 +42,7 @@ fn compressAnyToWebP(io: anytype, allocator: std.mem.Allocator, path: []const u8
 
     const raw_pixels = c.stbi_load(c_path.ptr, &width, &height, &comp, req_channels) orelse return error.ImageLoadFailed;
     if (raw_pixels == null) {
-        std.log.warn("SKIPPED file {s} is not a valid image", .{path});
+        std.log.err("SKIPPED file {s} is not a valid image", .{path});
         return;
     }
     defer c.stbi_image_free(raw_pixels);
@@ -95,14 +95,21 @@ fn compressAnyToWebP(io: anytype, allocator: std.mem.Allocator, path: []const u8
     }
 
     // -------------------------------------------------------------------------
-    // FASE 3: COMPRESSIONE E SCRITTURA (libwebp)
+    // FASE 3: COMPRESSIONE E SCRITTURA (libwebp o libjpeg-turbo)
     // -------------------------------------------------------------------------
     if (ForceJpeg) {
         const ch = c.tjInitCompress() orelse return error.TjInit;
         defer _ = c.tjDestroy(ch);
 
+        var last_buf: [*c]u8 = null;
+        var last_size: c_ulong = 0;
+        var last_quality: c_int = @round(shrink.DEFAULT_MIN_QUALITY);
+        defer {
+            if (last_buf != null) _ = c.tjFree(last_buf);
+        }
+
         var quality: c_int = 90;
-        while (quality >= 20) : (quality -= 5) {
+        while (quality >= @round(shrink.DEFAULT_MIN_QUALITY)) : (quality -= 5) {
             var out_buf: [*c]u8 = null;
             var out_size: c_ulong = 0;
 
@@ -111,52 +118,80 @@ fn compressAnyToWebP(io: anytype, allocator: std.mem.Allocator, path: []const u8
             if (c.tjCompress2(ch, final_pixels_ptr, final_width, 0, final_height, pixel_format, &out_buf, &out_size, c.TJSAMP_420, quality, flags) != 0) {
                 return error.TjCompress;
             }
-            defer _ = c.tjFree(out_buf);
 
-            if (out_size <= MaxSize) {
-                const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.shrunk.jpg", .{ out_dir, std.fs.path.stem(path) });
-                defer allocator.free(out_path);
+            if (last_buf != null) _ = c.tjFree(last_buf);
+            last_buf = out_buf;
+            last_size = out_size;
+            last_quality = quality;
 
-                const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
-                defer out_file.close(io);
-                var file_writer = out_file.writer(io, &.{});
-                try file_writer.interface.writeAll(out_buf[0..out_size]);
+            if (out_size <= MaxSize) break;
+        }
 
-                var size_buf: [32]u8 = undefined;
-                const formatted_size = try formatSize(out_size, &size_buf);
-                log.info("OK {s} -> {s} (JPEG {d}x{d}, q={d})", .{ path, formatted_size, final_width, final_height, quality });
-                return;
-            }
+        const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.shrunk.jpg", .{ out_dir, std.fs.path.stem(path) });
+        defer allocator.free(out_path);
+
+        const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+        defer out_file.close(io);
+        var file_writer = out_file.writer(io, &.{});
+        try file_writer.interface.writeAll(last_buf[0..@intCast(last_size)]);
+
+        var size_buf: [32]u8 = undefined;
+        const formatted_size = try formatSize(last_size, &size_buf);
+
+        if (last_size <= MaxSize) {
+            log.info("OK {s} -> {s} (JPEG {d}x{d}, q={d})", .{ path, formatted_size, final_width, final_height, last_quality });
+        } else {
+            var max_size_buf: [32]u8 = undefined;
+            const formatted_max_size = try formatSize(MaxSize, &max_size_buf);
+            log.warn("OK {s} -> {s} but still > {s} (JPEG {d}x{d}, q={d})", .{ path, formatted_size, formatted_max_size, final_width, final_height, last_quality });
         }
     } else {
+        var last_buf: [*]u8 = undefined;
+        var last_size: usize = 0;
+        var last_quality: f32 = shrink.DEFAULT_MIN_QUALITY;
+        var has_last: bool = false;
+        defer if (has_last) c.WebPFree(last_buf);
+
         var quality: f32 = 90.0;
-        while (quality >= 50.0) : (quality -= 5.0) {
+        while (quality >= @round(shrink.DEFAULT_MIN_QUALITY)) : (quality -= 5.0) {
             var out_buf: [*]u8 = undefined;
 
-            const out_size = c.WebPEncodeRGB(final_pixels_ptr, final_width, final_height, final_width * req_channels, quality, @ptrCast(&out_buf));
+            const out_size = if (req_channels == 4)
+                c.WebPEncodeRGBA(final_pixels_ptr, final_width, final_height, final_width * 4, quality, @ptrCast(&out_buf))
+            else
+                c.WebPEncodeRGB(final_pixels_ptr, final_width, final_height, final_width * 3, quality, @ptrCast(&out_buf));
+
             if (out_size == 0) return error.WebPCompressionFailed;
-            defer c.WebPFree(out_buf);
 
-            if (out_size <= MaxSize) {
-                const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.webp", .{ out_dir, std.fs.path.stem(path) });
-                defer allocator.free(out_path);
+            if (has_last) c.WebPFree(last_buf);
 
-                const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
-                defer out_file.close(io);
-                var file_writer = out_file.writer(io, &.{});
-                try file_writer.interface.writeAll(out_buf[0..out_size]);
+            last_buf = out_buf;
+            last_size = out_size;
+            last_quality = quality;
+            has_last = true;
 
-                var size_buf: [32]u8 = undefined;
-                const formatted_size = try formatSize(out_size, &size_buf);
+            if (out_size <= MaxSize) break;
+        }
 
-                log.info("OK {s} -> {s} (WebP {d}x{d}, q={d:.0})", .{ path, formatted_size, final_width, final_height, quality });
-                return;
-            }
+        const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.webp", .{ out_dir, std.fs.path.stem(path) });
+        defer allocator.free(out_path);
+
+        const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+        defer out_file.close(io);
+        var file_writer = out_file.writer(io, &.{});
+        try file_writer.interface.writeAll(last_buf[0..last_size]);
+
+        var size_buf: [32]u8 = undefined;
+        const formatted_size = try formatSize(last_size, &size_buf);
+
+        if (last_size <= MaxSize) {
+            log.info("OK {s} -> {s} (WebP {d}x{d}, q={d:.0})", .{ path, formatted_size, final_width, final_height, last_quality });
+        } else {
+            var max_size_buf: [32]u8 = undefined;
+            const formatted_max_size = try formatSize(MaxSize, &max_size_buf);
+            log.warn("WARNING {s} -> {s} still > {s} (WebP {d}x{d}, q={d:.0})", .{ path, formatted_size, formatted_max_size, final_width, final_height, last_quality });
         }
     }
-    var max_size_buf: [32]u8 = undefined;
-    const formatted_max_size = try formatSize(MaxSize, &max_size_buf);
-    log.warn("WARNING {s} still > {s}", .{ path, formatted_max_size });
 }
 
 fn worker(io: anytype, shared: *Shared) void {
@@ -174,12 +209,14 @@ fn worker(io: anytype, shared: *Shared) void {
             continue;
         }
 
-        const job = shared.queue.orderedRemove(0);
+        const job = shared.queue.pop().?;
         shared.mutex.unlock(io);
 
-        compressAnyToWebP(io, shared.allocator, job.path, job.out_dir) catch |e| {
-            log.err("❌ err {s}: {}", .{ job.path, e });
+        compressToWebPOrJpeg(io, shared.allocator, job.path, job.out_dir) catch |e| {
+            log.err("FAIL {s}: {}", .{ job.path, e });
         };
+
+        shared.allocator.free(job.path);
     }
 }
 
@@ -218,8 +255,28 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
 
-    if (args.len < 2) {
-        log.warn("⚠️ usage: shrinkpic <in-dir> [out-dir] --size=<dimensione>(MB|KB)", .{});
+    var help = false;
+    if (args.len > 1) {
+        const first_arg = args[1];
+        if (std.mem.eql(u8, first_arg, "--help") or std.mem.eql(u8, first_arg, "-h")) {
+            help = true;
+        }
+    }
+
+    if (args.len < 2 or help) {
+        std.debug.print(
+            \\
+            \\usage: ./zig-out/bin/shrinkpic <input_dir> [output_dir] [options]
+            \\
+            \\<input_dir>: The directory containing source images. Processes files concurrently (automatically skips system files like .DS_Store).
+            \\[output_dir]: Destination directory (created automatically if missing). If omitted, output files are written alongside the originals.
+            \\
+            \\Options
+            \\--size=<dimension>: Target maximum file size. Supports MB/mb or KB/kb (case-insensitive). Default: 200kb.
+            \\--jpeg: Forces output conversion to progressive JPEG instead of the default WebP.
+            \\--workers=<1-8>: Sets the number of concurrent worker threads. Throws an error if set outside the 1–8 range. Default: 8.
+            \\
+        , .{});
         return;
     }
 
@@ -234,18 +291,18 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, arg, "--size=")) {
             const size_str = arg["--size=".len..];
             max_size_parsed = parseSize(size_str) catch |err| {
-                log.err("❌ --size is in the wrong format: {}", .{err});
+                log.err("FAIL --size is in the wrong format: {}", .{err});
                 return err;
             };
         } else if (std.mem.startsWith(u8, arg, "--workers=")) {
             const workers_str = arg["--workers=".len..];
             const parsed_count: usize = std.fmt.parseInt(usize, workers_str, 10) catch {
-                log.err("❌ --workers has to be a valid integer", .{});
+                log.err("FAIL --workers has to be a valid integer", .{});
                 return error.InvalidWorkersNumber;
             };
 
             if (parsed_count < 1 or parsed_count > 8) {
-                log.err("❌ --workers should be between 1 and 8 (submitted: {d})", .{parsed_count});
+                log.err("FAIL --workers should be between 1 and 8 (submitted: {d})", .{parsed_count});
                 return error.InvalidWorkersCount;
             }
 
@@ -260,14 +317,14 @@ pub fn main(init: std.process.Init) !void {
                 out_dir_opt = arg;
                 positional_count += 1;
             } else {
-                log.err("❌ too much positional arguments", .{});
+                log.err("FAIL too much positional arguments", .{});
                 return error.TooManyArguments;
             }
         }
     }
 
     const final_dir_path = dir_path orelse {
-        log.warn("⚠️ missing <in-dir>", .{});
+        log.err("FAIL missing <in-dir>", .{});
         return error.MissingInDir;
     };
 
@@ -286,6 +343,7 @@ pub fn main(init: std.process.Init) !void {
 
     var dir = try std.Io.Dir.cwd().openDir(io, final_dir_path, .{ .iterate = true });
     defer dir.close(io);
+
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
@@ -307,6 +365,4 @@ pub fn main(init: std.process.Init) !void {
     shared.mutex.unlock(io);
 
     for (threads) |t| t.join();
-
-    for (shared.queue.items) |j| allocator.free(j.path);
 }
