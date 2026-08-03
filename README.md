@@ -28,6 +28,23 @@ brew install zig webp jpeg-turbo
 sudo apt install zig libwebp-dev libturbojpeg0-dev
 ```
 
+### Windows
+
+- Zig 0.16 (winget / scoop / choco / download ufficiale)
+- libwebp + libjpeg-turbo (via vcpkg o MSYS2)
+
+```bash
+# Zig
+winget install zig.zig
+# oppure
+scoop install zig
+# oppure
+choco install zig
+
+# Dipendenze (vcpkg)
+vcpkg install libwebp libjpeg-turbo
+```
+
 _Note: `stb_image` and `stb_image_resize2` are header-only and vendorcompiled inside the binary, no system installation required._
 
 ## Build
@@ -47,12 +64,18 @@ zig build -Doptimize=ReleaseFast
 # and loops (SIMD). If a bug occurs, it leads to Undefined Behavior.
 ```
 
-Binary destination: `zig-out/bin/shrinkpic`
+Binary destination: `zig-out/bin/shrinkpic` (Windows: `zig-out\bin\shrinkpic.exe`)
 
 ## Usage
 
 ```bash
 ./zig-out/bin/shrinkpic <input_dir> [output_dir] [options]
+```
+
+Windows:
+
+```bash
+.\zig-out\bin\shrinkpic.exe <input_dir> [output_dir] [options]
 ```
 
 ### Arguments

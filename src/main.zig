@@ -15,9 +15,10 @@ const Job = struct {
 
 const Shared = struct {
     mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     queue: std.ArrayList(Job),
-    done: bool = false,
     allocator: std.mem.Allocator,
+    done: bool = false,
 };
 
 fn compressToWebPOrJpeg(io: anytype, allocator: std.mem.Allocator, path: []const u8, out_dir: []const u8) !void {
@@ -127,7 +128,7 @@ fn compressToWebPOrJpeg(io: anytype, allocator: std.mem.Allocator, path: []const
             if (out_size <= MaxSize) break;
         }
 
-        const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.shrunk.jpg", .{ out_dir, std.fs.path.stem(path) });
+        const out_path = try std.fs.path.join(allocator, &.{ out_dir, try std.fmt.allocPrint(allocator, "{s}.jpg", .{std.fs.path.stem(path)}) });
         defer allocator.free(out_path);
 
         const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
@@ -173,7 +174,7 @@ fn compressToWebPOrJpeg(io: anytype, allocator: std.mem.Allocator, path: []const
             if (out_size <= MaxSize) break;
         }
 
-        const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.webp", .{ out_dir, std.fs.path.stem(path) });
+        const out_path = try std.fs.path.join(allocator, &.{ out_dir, try std.fmt.allocPrint(allocator, "{s}.webp", .{std.fs.path.stem(path)}) });
         defer allocator.free(out_path);
 
         const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
@@ -194,19 +195,15 @@ fn compressToWebPOrJpeg(io: anytype, allocator: std.mem.Allocator, path: []const
     }
 }
 
-fn worker(io: anytype, shared: *Shared) void {
+fn worker(io: std.Io, shared: *Shared) !void {
     while (true) {
         shared.mutex.lockUncancelable(io);
-
-        if (shared.queue.items.len == 0) {
+        while (shared.queue.items.len == 0) {
             if (shared.done) {
                 shared.mutex.unlock(io);
                 return;
             }
-            shared.mutex.unlock(io);
-            var ts = std.posix.timespec{ .sec = 0, .nsec = 1_000_000 };
-            _ = std.posix.system.nanosleep(&ts, &ts);
-            continue;
+            try shared.cond.wait(io, &shared.mutex);
         }
 
         const job = shared.queue.pop().?;
@@ -215,7 +212,6 @@ fn worker(io: anytype, shared: *Shared) void {
         compressToWebPOrJpeg(io, shared.allocator, job.path, job.out_dir) catch |e| {
             log.err("FAIL {s}: {}", .{ job.path, e });
         };
-
         shared.allocator.free(job.path);
     }
 }
@@ -250,6 +246,7 @@ pub fn formatSize(bytes: usize, buf: []u8) ![]const u8 {
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
+    const start = std.Io.Clock.awake.now(io);
     const allocator = std.heap.smp_allocator;
 
     const args = try init.minimal.args.toSlice(allocator);
@@ -336,10 +333,17 @@ pub fn main(init: std.process.Init) !void {
     ForceJpeg = force_jpeg or shrink.DEFAULT_FORCE_JPEG;
 
     var shared = Shared{
-        .queue = std.ArrayList(Job).empty,
+        .queue = .empty,
         .allocator = allocator,
     };
     defer shared.queue.deinit(allocator);
+
+    const threads = try allocator.alloc(std.Thread, WorkerCount);
+    defer allocator.free(threads);
+
+    for (threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, worker, .{ io, &shared });
+    }
 
     var dir = try std.Io.Dir.cwd().openDir(io, final_dir_path, .{ .iterate = true });
     defer dir.close(io);
@@ -350,19 +354,25 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, entry.name, ".")) continue;
 
         const full = try std.fs.path.join(allocator, &.{ final_dir_path, entry.name });
+
+        try shared.mutex.lock(io);
         try shared.queue.append(allocator, .{ .path = full, .out_dir = out_dir });
-    }
-
-    const threads = try allocator.alloc(std.Thread, WorkerCount);
-    defer allocator.free(threads);
-
-    for (threads) |*t| {
-        t.* = try std.Thread.spawn(.{}, worker, .{ io, &shared });
+        shared.mutex.unlock(io);
+        shared.cond.signal(io);
     }
 
     try shared.mutex.lock(io);
     shared.done = true;
     shared.mutex.unlock(io);
+    shared.cond.broadcast(io);
 
     for (threads) |t| t.join();
+
+    const elapsed = start.untilNow(io, .awake);
+    const total_ms: u64 = @intCast(@divFloor(elapsed.nanoseconds, std.time.ns_per_ms));
+    const h = total_ms / 3_600_000;
+    const m = (total_ms % 3_600_000) / 60_000;
+    const s = (total_ms % 60_000) / 1000;
+    const ms = total_ms % 1000;
+    log.info("Done in {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{ h, m, s, ms });
 }
